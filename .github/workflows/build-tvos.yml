@@ -1,0 +1,122 @@
+
+name: Build OrionTV for Apple TV
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-tvos:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      - name: Setup Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+          yarn --version
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Generate native projects
+        run: yarn prebuild
+
+      - name: Inspect Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d ios
+          find ios -maxdepth 2 \
+            \( -name '*.xcodeproj' -o -name '*.xcworkspace' \) \
+            -print
+
+          PROJECT="$(find ios -maxdepth 2 \
+            -name '*.xcodeproj' -print -quit)"
+
+          if [ -z "$PROJECT" ]; then
+            echo "No Xcode project generated."
+            exit 1
+          fi
+
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          xcodebuild -list -project "$PROJECT"
+
+      - name: Build tvOS app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$PROJECT"
+          mkdir -p "$RUNNER_TEMP/orion-derived"
+
+          # Try the likely tvOS scheme names.
+          # The actual scheme is confirmed by the previous step's logs.
+          SCHEMES=("OrionTV-tvOS" "OrionTV")
+
+          BUILT=0
+          for SCHEME in "${SCHEMES[@]}"; do
+            echo "Trying scheme: $SCHEME"
+
+            if xcodebuild \
+              -project "$PROJECT" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk appletvos \
+              -destination 'generic/platform=tvOS' \
+              -derivedDataPath "$RUNNER_TEMP/orion-derived" \
+              CODE_SIGNING_ALLOWED=NO \
+              build; then
+              BUILT=1
+              break
+            fi
+          done
+
+          if [ "$BUILT" -ne 1 ]; then
+            echo "No candidate scheme built successfully."
+            echo "Check the Xcode scheme list and build logs."
+            exit 1
+          fi
+
+          APP="$(find "$RUNNER_TEMP/orion-derived/Build/Products" \
+            -type d -name '*.app' -print -quit)"
+
+          if [ -z "$APP" ]; then
+            echo "Build succeeded but no .app was found."
+            exit 1
+          fi
+
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "Built app: $APP"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$APP" "$RUNNER_TEMP/ipa/Payload/$(basename "$APP")"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "$GITHUB_WORKSPACE/OrionTV-unsigned.ipa" Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrionTV-unsigned-tvos
+          path: OrionTV-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
